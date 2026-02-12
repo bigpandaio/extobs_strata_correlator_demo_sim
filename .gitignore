@@ -1,0 +1,26 @@
+# Environment secrets
+.env
+
+# Virtual environment
+venv/
+
+# Sent alerts tracking file
+.demo_sent_alerts.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
