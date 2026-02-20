@@ -32,7 +32,7 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
-    from rich.prompt import Prompt, IntPrompt, Confirm
+    from rich.prompt import Prompt, Confirm
     from rich.text import Text
     from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich import box
@@ -588,12 +588,17 @@ class DemoSimulator:
         """Prompt user to select one event by number."""
         self.console.print()
         try:
-            selection = IntPrompt.ask("Select event # to base the internal alert on")
+            raw = Prompt.ask(
+                "Select event # to base the internal alert on [dim](or 'q' to go back)[/dim]"
+            )
+            if raw.strip().lower() in ("q", "quit", "exit", "back"):
+                return None
+            selection = int(raw.strip())
             if selection in event_map:
                 return event_map[selection]
             self.console.print(f"[yellow]Invalid selection: {selection}[/yellow]")
             return None
-        except Exception:
+        except (ValueError, EOFError, KeyboardInterrupt):
             return None
 
     def show_event_detail(self, event):
@@ -954,9 +959,13 @@ class DemoSimulator:
         else:
             self.console.print()
             selection = Prompt.ask(
-                "Select alerts to resolve [dim](comma-separated numbers, or 'all')[/dim]",
+                "Select alerts to resolve [dim](comma-separated numbers, 'all', or 'q' to go back)[/dim]",
                 default="all",
             )
+
+            if selection.strip().lower() in ("q", "quit", "exit", "back"):
+                self.console.print("[dim]Cancelled.[/dim]")
+                return
 
             if selection.strip().lower() == "all":
                 to_resolve = list(alert_map.values())
