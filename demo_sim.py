@@ -32,7 +32,7 @@ try:
     from rich.console import Console
     from rich.table import Table
     from rich.panel import Panel
-    from rich.prompt import Prompt, Confirm
+    from rich.prompt import Prompt, IntPrompt, Confirm
     from rich.text import Text
     from rich.progress import Progress, SpinnerColumn, TextColumn
     from rich import box
@@ -47,11 +47,19 @@ except ImportError:
 # ─── Constants ───────────────────────────────────────────────────────────────
 
 PO_API_URL = "https://publicobservability.io/summary/current"
-BP_ALERTS_URL = "https://integrations.bigpanda.io/oim/api/alerts"
-OIM_CONFIG_BASE_URL = "https://integrations.bigpanda.io/configurations/alerts/oim"
 SENT_ALERTS_FILE = ".demo_sent_alerts.json"
 DEFAULT_MODEL = "gpt-5-mini"
 MAX_EVENT_AGE_HOURS = 15  # Exclude events with start_time older than this
+
+# BigPanda regional endpoints — resolved at runtime via BIGPANDA_REGION env var (US default)
+BP_INTEGRATIONS_URLS = {
+    "US": "https://integrations.bigpanda.io",
+    "EU": "https://eu.integrations.bigpanda.io",
+}
+BP_API_URLS = {
+    "US": "https://api.bigpanda.io",
+    "EU": "https://eu-api.bigpanda.io",
+}
 
 
 # ─── OIM Integration Configuration Payload ───────────────────────────────────
@@ -139,7 +147,25 @@ IMPORTANT RULES:
 4. The description must be 2-3 sentences of realistic monitoring language describing internal symptoms.
 5. DO NOT directly reference the external event in the description — it must appear to be an independent internal observation.
 6. The cluster should use a datacenter/region naming convention relevant to the geography.
-7. known_dependencies MUST be an array of 2-5 realistic upstream service or infrastructure names.
+7. known_dependencies MUST be an array of 2-5 realistic upstream service and/or infrastructure names.
+
+CRITICAL — Correlation requirements:
+The generated alert will be correlated against external events by an automated system
+that matches on entity names (companies, services, platforms, providers, locations).
+To ensure the correlation system can link the alert back to its causal event:
+
+- For SaaS/cloud/platform events: The affected provider and/or service name MUST appear
+  in the "service", "application", "check", and/or "known_dependencies" fields. For example,
+  if the external event is a Slack outage, include "Slack" in the service or application name
+  (e.g. service: "Slack Integration Service", known_dependencies: ["Slack API", ...]).
+
+- For power/ISP/weather events: The specific utility company, ISP name, and/or weather
+  agency name MUST appear in "known_dependencies". The "location" field must reference the
+  same city and/or address as the external event.
+
+- For cloud provider events (AWS, Azure, GCP): The provider name and affected service
+  MUST appear in "cloud_provider", "service", and/or "known_dependencies"
+  (e.g. known_dependencies: ["AWS EC2 - us-east-1", "AWS Direct Connect"]).
 
 FIELD REFERENCE AND EXAMPLES:
 
@@ -197,16 +223,16 @@ known_dependencies — Array of 2-5 upstream service/infrastructure dependencies
 business_owner — Fictional person name.
   Examples: "B. Panda", "J. Martinez", "S. Chen"
 
-EXAMPLE OUTPUT for "Power outage in Dallas, TX":
+EXAMPLE OUTPUT for "Power outage in Dallas, TX — Oncor Electric":
 {
   "host": "us-south-dal-db-primary-01.corp.internal",
-  "check": "database_cluster_health",
+  "check": "Oncor Utility Feed - PDU Health Monitor",
   "description": "UPS battery backup activated on primary rack cluster. Utility power feed interrupted to pods A3-A7. Generator failover initiated but 3 of 12 compute nodes experienced ungraceful shutdown during switchover.",
-  "service": "Core Infrastructure",
+  "service": "Core Infrastructure - Dallas DC1",
   "application": "Enterprise Data Platform",
   "cluster": "us-south-dallas-dc1",
-  "instance": "Rack A3 - PDU-Primary-01",
-  "location": "Dallas-Fort Worth DC1",
+  "instance": "Rack A3 - PDU-Primary-01 - Oncor Feed A",
+  "location": "Dallas-Fort Worth DC1, Dallas, Texas",
   "environment": "production",
   "cloud_region": "us-south-1",
   "cloud_provider": "hybrid",
@@ -214,8 +240,29 @@ EXAMPLE OUTPUT for "Power outage in Dallas, TX":
   "assignment_group": "Infrastructure - South Region",
   "escalation_group": "VP Infrastructure",
   "business_criticality": "tier 1",
-  "known_dependencies": ["AWS Cloud", "Core Switching Fabric - Dallas", "Enterprise Backup Power Grid", "Point of Presence - Dallas | AT&T MPLS (10 Gbps)"],
+  "known_dependencies": ["Oncor Electric Delivery - Dallas Utility Feed", "Core Switching Fabric - Dallas", "Enterprise Backup Power Grid", "Point of Presence - Dallas | AT&T MPLS (10 Gbps)"],
   "business_owner": "R. Dalton"
+}
+
+EXAMPLE OUTPUT for "Slack: Trouble Accessing Slack":
+{
+  "host": "int-eu-lon-integ-gw-01.corp.internal",
+  "check": "ThirdPartyIntegration - Slack API Healthcheck",
+  "description": "Slack API integration health check failing with HTTP 503 responses. Outbound webhook delivery queue depth increasing. Internal notification pipeline experiencing message delivery delays.",
+  "service": "Slack Integration Service",
+  "application": "Enterprise Collaboration Platform",
+  "cluster": "eu-west-integration-cluster",
+  "instance": "Slack Webhook Endpoint - https://hooks.slack.com/services/T00000/B00000",
+  "location": "London, UK - EU Integration Hub",
+  "environment": "production",
+  "cloud_region": "eu-west-1",
+  "cloud_provider": "aws",
+  "cloud_account_id": "sub-eu-prod-7c6d",
+  "assignment_group": "Application Team - Integrations",
+  "escalation_group": "Site Reliability Engineering",
+  "business_criticality": "tier 1",
+  "known_dependencies": ["Slack API", "Slack Webhooks", "Internal Message Bus", "AWS eu-west-1 NAT Gateway"],
+  "business_owner": "M. Laurent"
 }
 
 Respond with ONLY a valid JSON object containing ALL of the fields listed above. No additional text."""
@@ -252,9 +299,35 @@ class DemoSimulator:
 
         self.bp_org_token = os.getenv("BIGPANDA_ORG_ACCESS_TOKEN", "")
         self.bp_app_key = os.getenv("BIGPANDA_APP_KEY", "")
+        self.bp_org_name = os.getenv("BIGPANDA_ORG_NAME", "")
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
-        self.bp_alerts_url = os.getenv("BIGPANDA_ALERTS_URL", BP_ALERTS_URL)
         self.openai_model = os.getenv("OPENAI_MODEL", DEFAULT_MODEL)
+
+        # Resolve BigPanda regional base URLs (US default, EU via BIGPANDA_REGION=EU)
+        self.bp_region = os.getenv("BIGPANDA_REGION", "US").upper()
+        bp_integrations_base = BP_INTEGRATIONS_URLS.get(self.bp_region, BP_INTEGRATIONS_URLS["US"])
+        self.bp_api_base = BP_API_URLS.get(self.bp_region, BP_API_URLS["US"])
+        self.bp_alerts_url = os.getenv("BIGPANDA_ALERTS_URL", f"{bp_integrations_base}/oim/api/alerts")
+        self.oim_config_base_url = f"{bp_integrations_base}/configurations/alerts/oim"
+
+        if not self.bp_org_name and self.bp_org_token:
+            self.bp_org_name = self._resolve_org_name()
+
+    def _resolve_org_name(self):
+        """Resolve the org name from the BigPanda API using the Org Access Token."""
+        try:
+            resp = requests.get(
+                f"{self.bp_api_base}/resources/v2.0/organizations/me",
+                headers={"Authorization": f"Bearer {self.bp_org_token}",
+                         "Accept": "application/json"},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                return data.get("name", data.get("org_name", ""))
+        except requests.exceptions.RequestException:
+            pass
+        return ""
 
     def _validate_config(self):
         """Check all required environment variables are set. Returns list of missing var names."""
@@ -343,6 +416,9 @@ class DemoSimulator:
         banner.append("Generates realistic internal alerts aligned\n")
         banner.append("with live external disruption events to\n")
         banner.append("demonstrate automatic correlation.\n\n", style="")
+        org_display = self.bp_org_name if self.bp_org_name else "unknown"
+        banner.append(f"Org: {org_display}  ", style="bold yellow")
+        banner.append(f"Region: {self.bp_region}  ", style="bold yellow")
         banner.append(f"Model: {self.openai_model}  ", style="dim")
         banner.append(f"Target: {self.bp_alerts_url}", style="dim")
         self.console.print(Panel(banner, box=box.DOUBLE, border_style="cyan"))
@@ -546,11 +622,13 @@ class DemoSimulator:
         table.add_column("#", style="dim", width=4, justify="right")
         table.add_column("Type", width=10)
         table.add_column("Sev", width=9)
+        table.add_column("Started", width=10, justify="right")
         table.add_column("Title", max_width=50)
         table.add_column("Location", max_width=30)
 
         display_limit = 40
         event_map = {}
+        now = datetime.now(timezone.utc)
 
         for i, event in enumerate(filtered[:display_limit], 1):
             severity = event.get("severity", "unknown")
@@ -564,10 +642,27 @@ class DemoSimulator:
             location = event.get("location", {}).get("description", "N/A")
             title = event.get("title", "N/A")
 
+            ago_str = ""
+            start_time = event.get("start_time", "")
+            if start_time:
+                try:
+                    st = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+                    delta = now - st
+                    total_min = int(delta.total_seconds() // 60)
+                    if total_min < 60:
+                        ago_str = f"{total_min}m ago"
+                    elif total_min < 1440:
+                        ago_str = f"{total_min // 60}h {total_min % 60}m ago"
+                    else:
+                        ago_str = f"{total_min // 1440}d {(total_min % 1440) // 60}h ago"
+                except (ValueError, TypeError):
+                    ago_str = "?"
+
             table.add_row(
                 str(i),
                 event.get("alert_type", "?"),
                 f"[{sev_style}]{severity}[/{sev_style}]",
+                f"[dim]{ago_str}[/dim]",
                 truncate(title, 48),
                 truncate(location, 28),
             )
@@ -588,17 +683,12 @@ class DemoSimulator:
         """Prompt user to select one event by number."""
         self.console.print()
         try:
-            raw = Prompt.ask(
-                "Select event # to base the internal alert on [dim](or 'q' to go back)[/dim]"
-            )
-            if raw.strip().lower() in ("q", "quit", "exit", "back"):
-                return None
-            selection = int(raw.strip())
+            selection = IntPrompt.ask("Select event # to base the internal alert on")
             if selection in event_map:
                 return event_map[selection]
             self.console.print(f"[yellow]Invalid selection: {selection}[/yellow]")
             return None
-        except (ValueError, EOFError, KeyboardInterrupt):
+        except Exception:
             return None
 
     def show_event_detail(self, event):
@@ -959,13 +1049,9 @@ class DemoSimulator:
         else:
             self.console.print()
             selection = Prompt.ask(
-                "Select alerts to resolve [dim](comma-separated numbers, 'all', or 'q' to go back)[/dim]",
+                "Select alerts to resolve [dim](comma-separated numbers, or 'all')[/dim]",
                 default="all",
             )
-
-            if selection.strip().lower() in ("q", "quit", "exit", "back"):
-                self.console.print("[dim]Cancelled.[/dim]")
-                return
 
             if selection.strip().lower() == "all":
                 to_resolve = list(alert_map.values())
@@ -1028,9 +1114,9 @@ class DemoSimulator:
     def setup_oim_integration(self):
         """Configure the BigPanda OIM integration with the expected payload format.
 
-        POST https://integrations.bigpanda.io/configurations/alerts/oim/{app_key}
+        POST {integrations_base}/configurations/alerts/oim/{app_key}
         """
-        config_url = f"{OIM_CONFIG_BASE_URL}/{self.bp_app_key}"
+        config_url = f"{self.oim_config_base_url}/{self.bp_app_key}"
 
         self.console.print()
         self.console.print(
