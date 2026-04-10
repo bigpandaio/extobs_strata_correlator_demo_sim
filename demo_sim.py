@@ -605,12 +605,17 @@ class DemoSimulator:
             return [], {}
 
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
-        filtered.sort(
-            key=lambda x: (
-                severity_order.get(x.get("severity", "low"), 3),
-                x.get("start_time", ""),
-            )
-        )
+
+        def _event_sort_key(e):
+            sev = severity_order.get(e.get("severity", "low"), 3)
+            s = e.get("start_time", "")
+            try:
+                ts = datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+            except (ValueError, TypeError, AttributeError):
+                ts = 0
+            return (sev, -ts)
+
+        filtered.sort(key=_event_sort_key)
 
         table = Table(
             title=f"Active Events ({len(filtered)} matching)",
